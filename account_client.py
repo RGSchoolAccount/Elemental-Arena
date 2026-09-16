@@ -37,7 +37,7 @@ def _post(path, payload):
             message = "Something went wrong."
         return False, message
     except urllib.error.URLError:
-        return False, "Can't reach the account server. Check your connection/SERVER_URL."
+        return False, "Can't reach the account server. Check server_log.txt next to the game for why."
     except Exception:
         return False, "Something went wrong."
 
@@ -56,7 +56,7 @@ def _get(path, timeout=TIMEOUT_SECONDS):
             message = "Something went wrong."
         return False, message
     except urllib.error.URLError:
-        return False, "Can't reach the account server. Check your connection/SERVER_URL."
+        return False, "Can't reach the account server. Check server_log.txt next to the game for why."
     except Exception:
         return False, "Something went wrong."
 
@@ -115,4 +115,13 @@ def admin_delete_account(admin_username, admin_password, target_username):
     return _post("/admin/delete_account", {
         "admin_username": admin_username, "admin_password": admin_password,
         "target_username": target_username,
+    })
+
+
+def purchase_variant(username, element, variant_id):
+    """Returns (success, account_dict_or_error_message). Cost is looked
+    up and validated server-side from variants.py - never trust a cost
+    the client sends."""
+    return _post("/purchase_variant", {
+        "username": username, "element": element, "variant_id": variant_id,
     })

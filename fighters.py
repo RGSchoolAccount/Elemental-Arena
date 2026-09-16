@@ -12,11 +12,12 @@ class Fighter:
     STAMINA_REGEN_PER_SEC = 14
     STREAK_TIMEOUT = 3.0
 
-    def __init__(self, element, position, name, base_speed, starting_ult=0, team=None):
+    def __init__(self, element, position, name, base_speed, starting_ult=0, team=None, variant=None):
         self.element = element
         self.pos = Vector2(position)
         self.name = name
         self.team = team  # None everywhere except Domination ("blue"/"red")
+        self.variant = variant  # None = default kit; otherwise a purchased variant id
 
         self.max_hp = 100
         self.hp = 100

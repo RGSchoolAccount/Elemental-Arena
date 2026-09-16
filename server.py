@@ -25,12 +25,15 @@ SERVER_URL at the top of account_client.py so the game knows where to
 find it.
 """
 
+import json
 import os
 import sqlite3
 from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request
 from werkzeug.security import check_password_hash, generate_password_hash
+
+import variants
 
 
 def _default_data_dir():
@@ -130,6 +133,9 @@ def init_db():
     if "is_admin" not in existing_columns:
         connection.execute("ALTER TABLE accounts ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
 
+    if "owned_variants" not in existing_columns:
+        connection.execute("ALTER TABLE accounts ADD COLUMN owned_variants TEXT NOT NULL DEFAULT '[]'")
+
     connection.commit()
 
     # Seed (or refresh) the admin account every startup, so its
@@ -139,27 +145,28 @@ def init_db():
         "SELECT username FROM accounts WHERE LOWER(username) = LOWER(?)", (ADMIN_USERNAME,)
     ).fetchone()
     admin_hash = generate_password_hash(ADMIN_PASSWORD)
+    admin_variants = json.dumps(variants.all_variant_ids())
 
     if admin_row is None:
         connection.execute(
             """
             INSERT INTO accounts
-                (username, password_hash, date_joined, xp, level, currency, is_admin)
-            VALUES (?, ?, ?, ?, ?, ?, 1)
+                (username, password_hash, date_joined, xp, level, currency, is_admin, owned_variants)
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?)
             """,
             (
                 ADMIN_USERNAME, admin_hash, datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                ADMIN_XP, MAX_LEVEL, ADMIN_CURRENCY,
+                ADMIN_XP, MAX_LEVEL, ADMIN_CURRENCY, admin_variants,
             ),
         )
     else:
         connection.execute(
             """
             UPDATE accounts
-            SET password_hash = ?, xp = ?, level = ?, currency = ?, is_admin = 1
+            SET password_hash = ?, xp = ?, level = ?, currency = ?, is_admin = 1, owned_variants = ?
             WHERE username = ?
             """,
-            (admin_hash, ADMIN_XP, MAX_LEVEL, ADMIN_CURRENCY, admin_row["username"]),
+            (admin_hash, ADMIN_XP, MAX_LEVEL, ADMIN_CURRENCY, admin_variants, admin_row["username"]),
         )
 
     connection.commit()
@@ -167,6 +174,11 @@ def init_db():
 
 
 def account_to_dict(row):
+    try:
+        owned_variants = json.loads(row["owned_variants"])
+    except (ValueError, TypeError):
+        owned_variants = []
+
     return {
         "username": row["username"],
         "date_joined": row["date_joined"],
@@ -177,6 +189,7 @@ def account_to_dict(row):
         "level": row["level"],
         "currency": row["currency"],
         "is_admin": bool(row["is_admin"]),
+        "owned_variants": owned_variants,
     }
 
 
@@ -402,6 +415,62 @@ def admin_delete_account():
     connection.close()
 
     return jsonify({"deleted": True}), 200
+
+
+@app.route("/purchase_variant", methods=["POST"])
+def purchase_variant():
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    element = (data.get("element") or "").strip()
+    variant_id = (data.get("variant_id") or "").strip()
+
+    variant = variants.get_variant(element, variant_id)
+
+    if variant is None:
+        return jsonify({"error": "No such variant."}), 404
+
+    connection = get_db()
+    row = connection.execute(
+        "SELECT * FROM accounts WHERE LOWER(username) = LOWER(?)", (username,)
+    ).fetchone()
+
+    if row is None:
+        connection.close()
+        return jsonify({"error": "No such account."}), 404
+
+    try:
+        owned = json.loads(row["owned_variants"])
+    except (ValueError, TypeError):
+        owned = []
+
+    if variant_id in owned:
+        connection.close()
+        return jsonify({"error": "Already owned."}), 400
+
+    # Cost is looked up from variants.py on this end, never trusted from
+    # the client - otherwise a modified client could just claim a cost
+    # of 0.
+    cost = variant["cost"]
+
+    if row["currency"] < cost:
+        connection.close()
+        return jsonify({"error": "Not enough coins."}), 400
+
+    owned.append(variant_id)
+    new_currency = row["currency"] - cost
+
+    connection.execute(
+        "UPDATE accounts SET currency = ?, owned_variants = ? WHERE username = ?",
+        (new_currency, json.dumps(owned), row["username"]),
+    )
+    connection.commit()
+
+    updated_row = connection.execute(
+        "SELECT * FROM accounts WHERE username = ?", (row["username"],)
+    ).fetchone()
+    connection.close()
+
+    return jsonify(account_to_dict(updated_row)), 200
 
 
 if __name__ == "__main__":

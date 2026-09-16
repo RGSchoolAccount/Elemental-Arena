@@ -18,6 +18,7 @@ from trails import Trail
 import account_client as account
 import story
 import secret
+import variants
 
 pygame.init()
 
@@ -146,10 +147,15 @@ atexit.register(restore_sticky_keys)
 # ping will succeed and we never even try to launch it.
 
 _account_server_process = None
+_local_server_failed = False
+
+
+def _server_log_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_log.txt")
 
 
 def _start_local_account_server():
-    global _account_server_process
+    global _account_server_process, _local_server_failed
 
     if account.ping():
         return  # something's already answering - nothing to do
@@ -161,11 +167,16 @@ def _start_local_account_server():
 
     try:
         creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        # Logged to a file instead of discarded - if the server fails to
+        # start (missing dependency, port already in use, etc.) this is
+        # the only way to actually see why, since this process has no
+        # console window of its own.
+        log_file = open(_server_log_path(), "w")
         _account_server_process = subprocess.Popen(
             [sys.executable, server_path],
             cwd=os.path.dirname(server_path),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
             creationflags=creation_flags,
         )
     except Exception:
@@ -175,8 +186,10 @@ def _start_local_account_server():
     # Give it a moment to come up before the player might try to log in.
     for _ in range(20):
         if account.ping():
-            break
+            return
         time.sleep(0.15)
+
+    _local_server_failed = True
 
 
 def _stop_local_account_server():
@@ -949,6 +962,8 @@ def setup_domination_points():
     ]
 
 selected_element = "fire"
+selected_variant_id = None
+variant_picker_element = None
 opponent_count = 1
 practice_mode = False
 combat_input_locked = True
@@ -988,6 +1003,7 @@ admin_panel_error = ""
 admin_panel_scroll = 0
 admin_accounts = []
 admin_confirm_delete_username = None  # set while confirming a specific delete
+shop_error = ""
 
 tutorial_active = False
 tutorial_step = 0
@@ -1028,6 +1044,7 @@ tsunami = None
 fire_zone = None
 symphony = None
 cyclone = None
+fire_ring = None
 
 entering_tutorial = False
 tutorial_element = "fire"
@@ -1264,6 +1281,18 @@ for _count in range(1, MAX_OPPONENTS + 1):
         _COUNT_BTN_W,
         _COUNT_BTN_H,
     )
+
+
+def get_equipped_variant(element):
+    if selected_element != element or selected_variant_id is None:
+        return None
+
+    return variants.get_variant(element, selected_variant_id)
+
+
+def owned_variants_for(element):
+    owned_ids = (account_stats or {}).get("owned_variants", [])
+    return [v for v in variants.VARIANTS.get(element, []) if v["id"] in owned_ids]
 
 
 def is_average_god_unlocked():
@@ -1888,7 +1917,7 @@ def start_match(practice=False, story_element=None, domination=False):
     global damage_numbers, kill_feed, screen_shake_timer
     global blizzard, earthquake, vine_leech, vine_whip, burrow, eternal_night, thunderstorm
     global hover, iron_maiden, bloodlust, adrenaline, bear_ride, monster
-    global water_beam_visual, tsunami, fire_zone, symphony, cyclone
+    global water_beam_visual, tsunami, fire_zone, symphony, cyclone, fire_ring
     global storm_radius, storm_wait, game_over, winner_text, practice_mode
     global combat_input_locked
     global match_result_recorded
@@ -1926,6 +1955,7 @@ def start_match(practice=False, story_element=None, domination=False):
             300,
             starting_ult=40,
             team="blue",
+            variant=selected_variant_id if selected_element in variants.VARIANTS else None,
         )
 
         if selected_element == "earth":
@@ -2003,6 +2033,7 @@ def start_match(practice=False, story_element=None, domination=False):
             "YOU",
             300,
             starting_ult=100 if practice else 40,
+            variant=selected_variant_id if selected_element in variants.VARIANTS else None,
         )
 
         if selected_element == "earth":
@@ -2085,6 +2116,7 @@ def start_match(practice=False, story_element=None, domination=False):
     fire_zone = None
     symphony = None
     cyclone = None
+    fire_ring = None
 
     storm_radius = 6000 if (practice or story_element is not None or domination) else 1700
     storm_wait = 999999 if (practice or story_element is not None or domination) else 16
@@ -2430,6 +2462,8 @@ def spawn_icicle_ring(fighter):
 
 
 def shoot_projectile(owner, direction, life=2.6):
+    global fire_ring
+
     if direction.length() == 0:
         return
 
@@ -2440,6 +2474,19 @@ def shoot_projectile(owner, direction, life=2.6):
         return
 
     owner.spend_stamina(STAMINA_COST_LONG)
+
+    if owner.element == "fire" and owner.variant == "fire_blueflame":
+        # Wildfire Ring: a short-lived ring of fire around the caster,
+        # instead of a travelling fireball - see update_specials().
+        fire_ring = {
+            "owner": owner,
+            "life": 1.5,
+            "max_life": 1.5,
+            "radius": 95,
+            "tick_timer": 0,
+        }
+        add_effect(owner.pos, (160, 210, 255), 95, 0.3)
+        return
 
     stats = {
         "fire": ((255, 150, 25), 13, 570, 9),
@@ -2595,6 +2642,42 @@ def perform_short_attack(attacker, aim_direction):
 
             if direction.normalize().dot(direction_to_enemy) > 0.1:
                 targets.append(fighter)
+
+    if attacker.element == "fire" and attacker.variant == "fire_blueflame":
+        # Ashwalker Slash: dash forward first (a real gap-closer, unlike
+        # the base punch), then hit EVERYONE caught in the cone instead
+        # of just the nearest target - a wide slash, not a single punch.
+        old_pos = attacker.pos.copy()
+        attacker.dash(60, ARENA)
+
+        for number in range(4):
+            trails.append(Trail(old_pos.lerp(attacker.pos, number / 3), "fire", team=attacker.team))
+
+        dmg_mult = owner_damage_multiplier(attacker)
+        hit_anyone = False
+
+        for fighter in targets:
+            hp_before = fighter.hp
+            fighter.damage(14 * dmg_mult)
+            fighter.burn(2)
+            actual_dealt = max(0, hp_before - fighter.hp)
+
+            if actual_dealt > 0:
+                hit_anyone = True
+                spawn_damage_number(fighter.pos, actual_dealt)
+                attacker.register_hit(actual_dealt)
+
+                if not fighter.alive:
+                    attacker.register_kill()
+                    spawn_kill_feed(f"{attacker.name} eliminated {fighter.name}")
+
+            add_effect(fighter.pos, (160, 210, 255), 45, 0.2)
+
+        if hit_anyone:
+            play_sound(hit_sound)
+            attacker.ult = min(100, attacker.ult + 20)
+
+        return
 
     if not targets:
         if monster is not None and monster["owner"] is not attacker:
@@ -3285,7 +3368,7 @@ def player_on_ice_trail():
 def update_specials(dt):
     global blizzard, earthquake, vine_leech, vine_whip, burrow, eternal_night, thunderstorm
     global hover, iron_maiden, bloodlust, adrenaline, bear_ride, tsunami, fire_zone
-    global symphony, cyclone
+    global symphony, cyclone, fire_ring
 
     if vine_whip is not None:
         vine_whip["life"] -= dt
@@ -3558,6 +3641,28 @@ def update_specials(dt):
         if cyclone["life"] <= 0:
             cyclone = None
 
+    if fire_ring is not None:
+        if not fire_ring["owner"].alive:
+            fire_ring = None
+        else:
+            fire_ring["life"] -= dt
+            fire_ring["tick_timer"] -= dt
+            owner = fire_ring["owner"]
+
+            if fire_ring["tick_timer"] <= 0:
+                fire_ring["tick_timer"] = 0.25
+
+                for target in opponents_of(owner):
+                    if in_shadow_pocket(target):
+                        continue
+
+                    if target.pos.distance_to(owner.pos) < fire_ring["radius"]:
+                        target.damage(6 * owner_damage_multiplier(owner))
+                        target.burn(1.0)
+
+            if fire_ring is not None and fire_ring["life"] <= 0:
+                fire_ring = None
+
 
 def update_monster(dt):
     global monster
@@ -3646,25 +3751,96 @@ def update_screen_shake(dt):
         screen_shake_timer = max(0, screen_shake_timer - dt)
 
 
+MENU_BG_TOP = (28, 24, 36)
+MENU_BG_BOTTOM = (13, 15, 23)
+
+
+def draw_menu_background():
+    """The shared backdrop for every menu/hub screen - draw_match()
+    fully overwrites this during actual play, so this never touches
+    gameplay rendering. A soft gradient + drifting embers + vignette,
+    instead of the old flat fill."""
+    steps = 36
+
+    for step in range(steps):
+        t = step / (steps - 1)
+        color = tuple(
+            int(MENU_BG_TOP[channel] + (MENU_BG_BOTTOM[channel] - MENU_BG_TOP[channel]) * t)
+            for channel in range(3)
+        )
+        band_top = int(HEIGHT * step / steps)
+        band_height = int(HEIGHT / steps) + 2
+        pygame.draw.rect(screen, color, (0, band_top, WIDTH, band_height))
+
+    t = pygame.time.get_ticks() / 1000
+
+    for index in range(24):
+        rng = random.Random(index * 7 + 1)
+        base_x = rng.uniform(0, WIDTH)
+        base_y = rng.uniform(0, HEIGHT)
+        drift_y = (base_y - t * 10) % HEIGHT
+        flicker = (math.sin(t * 2 + index) + 1) / 2
+        size = 1 + int(flicker * 2)
+        shade = int(70 + flicker * 60)
+        pygame.draw.circle(
+            screen, (shade, int(shade * 0.55), int(shade * 0.3)),
+            (int(base_x), int(drift_y)), size,
+        )
+
+    vignette = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    pygame.draw.rect(vignette, (0, 0, 0, 70), (0, 0, WIDTH, 36))
+    pygame.draw.rect(vignette, (0, 0, 0, 70), (0, HEIGHT - 36, WIDTH, 36))
+    screen.blit(vignette, (0, 0))
+
+
+def draw_panel(rect, accent_color=(90, 90, 105), fill=(30, 33, 44), border=3):
+    """The encyclopedia's panel look, factored out so other screens can
+    share it: a dark rounded card with a colored accent border."""
+    pygame.draw.rect(screen, fill, rect, border_radius=14)
+    pygame.draw.rect(screen, accent_color, rect, border, border_radius=14)
+
+
+def draw_title_banner(text, y=90, color="white"):
+    """A consistent title treatment - big centered text with a short
+    accent underline - used across menu/hub screens instead of each
+    one doing its own ad hoc title line."""
+    title = big_font.render(text, True, color)
+    title_rect = title.get_rect(center=(WIDTH // 2, y))
+    screen.blit(title, title_rect)
+
+    underline_width = min(360, title_rect.width + 60)
+    underline = pygame.Rect(0, 0, underline_width, 3)
+    underline.center = (WIDTH // 2, y + title_rect.height // 2 + 10)
+    pygame.draw.rect(screen, (255, 190, 60), underline, border_radius=2)
+
+
+def draw_nice_button(rect, label, mouse, accent=(220, 110, 45), idle=(88, 82, 92), text_color="white", text_font=None):
+    """A consistent button treatment: idle fill, brighter accent fill on
+    hover, and a subtle lighter border - replaces the many slightly
+    different ad hoc button-drawing snippets scattered across screens."""
+    text_font = text_font or font
+    hovered = rect.collidepoint(mouse)
+    color = accent if hovered else idle
+    pygame.draw.rect(screen, color, rect, border_radius=12)
+    border_color = tuple(min(255, channel + 45) for channel in color)
+    pygame.draw.rect(screen, border_color, rect, 2, border_radius=12)
+    text = text_font.render(label, True, text_color)
+    screen.blit(text, text.get_rect(center=rect.center))
+
+
 def draw_menu():
-    title = big_font.render("ELEMENTAL ARENA", True, (255, 190, 60))
-    screen.blit(title, title.get_rect(center=(WIDTH // 2, 120)))
+    draw_title_banner("ELEMENTAL ARENA", y=120, color=(255, 190, 60))
 
     mouse = pygame.mouse.get_pos()
 
     for key, button in menu_buttons.items():
-        color = (220, 110, 45) if button.collidepoint(mouse) else (90, 80, 85)
-        pygame.draw.rect(screen, color, button, border_radius=12)
+        draw_nice_button(button, MENU_BUTTON_LABELS[key], mouse)
 
-        text = font.render(MENU_BUTTON_LABELS[key], True, "white")
-        screen.blit(text, text.get_rect(center=button.center))
-
-    account_color = (220, 110, 45) if ACCOUNT_CORNER_BUTTON.collidepoint(mouse) else (70, 75, 90)
-    pygame.draw.rect(screen, account_color, ACCOUNT_CORNER_BUTTON, border_radius=10)
-
-    account_label = account_username if account_username is not None else "ACCOUNT"
-    account_text = font.render(account_label, True, "white")
-    screen.blit(account_text, account_text.get_rect(center=ACCOUNT_CORNER_BUTTON.center))
+    draw_nice_button(
+        ACCOUNT_CORNER_BUTTON,
+        account_username if account_username is not None else "ACCOUNT",
+        mouse, idle=(70, 75, 90),
+    )
 
 
 STORY_HUB_CONTINUE_BUTTON = pygame.Rect(400, 590, 300, 55)
@@ -3680,14 +3856,13 @@ def story_hub_row_rect(index):
 
 
 def draw_story_hub():
-    title = big_font.render("STORY MODE", True, (255, 190, 60))
-    screen.blit(title, title.get_rect(center=(WIDTH // 2, 90)))
+    draw_title_banner("STORY MODE", y=90, color=(255, 190, 60))
 
     subtitle = small_font.render(
         f"Fire's son, {story.STORY_SON_NAME}, has been taken. Fight your way to Water.",
         True, (190, 190, 205),
     )
-    screen.blit(subtitle, subtitle.get_rect(center=(WIDTH // 2, 128)))
+    screen.blit(subtitle, subtitle.get_rect(center=(WIDTH // 2, 132)))
 
     mouse = pygame.mouse.get_pos()
 
@@ -3726,10 +3901,7 @@ def draw_story_hub():
     else:
         button_label = "CONTINUE STORY"
 
-    button_color = (220, 110, 45) if STORY_HUB_CONTINUE_BUTTON.collidepoint(mouse) else (90, 80, 85)
-    pygame.draw.rect(screen, button_color, STORY_HUB_CONTINUE_BUTTON, border_radius=12)
-    button_text = font.render(button_label, True, "white")
-    screen.blit(button_text, button_text.get_rect(center=STORY_HUB_CONTINUE_BUTTON.center))
+    draw_nice_button(STORY_HUB_CONTINUE_BUTTON, button_label, mouse)
 
     pygame.draw.rect(screen, (75, 75, 90), back_button, border_radius=8)
     draw_text("BACK", 63, 36)
@@ -4133,25 +4305,19 @@ def draw_story_cutscene():
 
 
 def draw_game_modes():
-    title = big_font.render("GAME MODES", True, (255, 190, 60))
-    screen.blit(title, title.get_rect(center=(WIDTH // 2, 120)))
+    draw_title_banner("GAME MODES", y=120, color=(255, 190, 60))
 
     mouse = pygame.mouse.get_pos()
 
     for key, button in GAME_MODE_BUTTONS.items():
-        color = (220, 110, 45) if button.collidepoint(mouse) else (90, 80, 85)
-        pygame.draw.rect(screen, color, button, border_radius=12)
-
-        text = font.render(GAME_MODE_BUTTON_LABELS[key], True, "white")
-        screen.blit(text, text.get_rect(center=button.center))
+        draw_nice_button(button, GAME_MODE_BUTTON_LABELS[key], mouse)
 
     pygame.draw.rect(screen, (75, 75, 90), back_button, border_radius=8)
     draw_text("BACK", 63, 36)
 
 
 def draw_encyclopedia():
-    title = big_font.render("CHARACTER ENCYCLOPEDIA", True, "white")
-    screen.blit(title, title.get_rect(center=(WIDTH // 2, 65)))
+    draw_title_banner("CHARACTER ENCYCLOPEDIA", y=65, color="white")
 
     mouse = pygame.mouse.get_pos()
 
@@ -4220,17 +4386,12 @@ def draw_encyclopedia():
 
 
 def draw_how_to_play_hub():
-    title = big_font.render("HOW TO PLAY", True, "white")
-    screen.blit(title, title.get_rect(center=(WIDTH // 2, 170)))
+    draw_title_banner("HOW TO PLAY", y=170, color="white")
 
     mouse = pygame.mouse.get_pos()
 
     for key, button in HUB_BUTTONS.items():
-        color = (220, 110, 45) if button.collidepoint(mouse) else (90, 80, 85)
-        pygame.draw.rect(screen, color, button, border_radius=12)
-
-        text = font.render(HUB_BUTTON_LABELS[key], True, "white")
-        screen.blit(text, text.get_rect(center=button.center))
+        draw_nice_button(button, HUB_BUTTON_LABELS[key], mouse)
 
     pygame.draw.rect(screen, (75, 75, 90), back_button, border_radius=8)
     draw_text("BACK", 63, 36)
@@ -4326,9 +4487,42 @@ def draw_shop_stall():
     )
 
 
+SHOP_CARD_WIDTH = 260
+SHOP_CARD_HEIGHT = 150
+SHOP_CARD_GAP = 20
+SHOP_CARDS_TOP = 260
+SHOP_CARDS_COLS = 3
+
+
+def shop_variant_cards():
+    """Returns [(element, variant, card_rect, button_rect), ...] for
+    every purchasable variant across every element - currently just
+    Fire's, but laid out to support more without changes here."""
+    all_variants = [
+        (element, variant)
+        for element, variant_list in variants.VARIANTS.items()
+        for variant in variant_list
+    ]
+
+    row_width = SHOP_CARDS_COLS * (SHOP_CARD_WIDTH + SHOP_CARD_GAP) - SHOP_CARD_GAP
+    start_x = WIDTH // 2 - row_width // 2
+
+    cards = []
+
+    for index, (element, variant) in enumerate(all_variants):
+        col = index % SHOP_CARDS_COLS
+        row = index // SHOP_CARDS_COLS
+        card_x = start_x + col * (SHOP_CARD_WIDTH + SHOP_CARD_GAP)
+        card_y = SHOP_CARDS_TOP + row * (SHOP_CARD_HEIGHT + SHOP_CARD_GAP)
+        card_rect = pygame.Rect(card_x, card_y, SHOP_CARD_WIDTH, SHOP_CARD_HEIGHT)
+        button_rect = pygame.Rect(card_rect.x + 16, card_rect.bottom - 42, card_rect.width - 32, 32)
+        cards.append((element, variant, card_rect, button_rect))
+
+    return cards
+
+
 def draw_shop():
-    title = big_font.render("SHOP", True, "white")
-    screen.blit(title, title.get_rect(center=(WIDTH // 2, 90)))
+    draw_title_banner("SHOP", y=90, color="white")
 
     if account_username is None:
         draw_shop_stall()
@@ -4345,22 +4539,60 @@ def draw_shop():
         screen.blit(text, text.get_rect(center=ACCOUNT_LOGIN_BUTTON.center))
     else:
         currency = (account_stats or {}).get("currency", 0)
+        owned = (account_stats or {}).get("owned_variants", [])
         draw_text(f"Your coins: {currency}", WIDTH // 2 - 90, 150, (255, 210, 120), big_font)
 
-        draw_shop_stall()
+        mouse = pygame.mouse.get_pos()
+        cards = shop_variant_cards()
 
-        sold_out_font = pygame.font.SysFont("arial", 64, bold=True)
-        sold_out_text = sold_out_font.render("ALL SOLD OUT", True, (255, 235, 235))
-        rotated = pygame.transform.rotate(sold_out_text, 12)
-        screen.blit(rotated, rotated.get_rect(center=(WIDTH // 2, 400)))
+        if not cards:
+            draw_shop_stall()
+            sold_out_font = pygame.font.SysFont("arial", 64, bold=True)
+            sold_out_text = sold_out_font.render("ALL SOLD OUT", True, (255, 235, 235))
+            rotated = pygame.transform.rotate(sold_out_text, 12)
+            screen.blit(rotated, rotated.get_rect(center=(WIDTH // 2, 400)))
+        else:
+            for element, variant, card_rect, button_rect in cards:
+                is_owned = variant["id"] in owned
+                can_afford = currency >= variant["cost"]
+
+                card_fill = tuple(channel // 4 for channel in variant["color"])
+                pygame.draw.rect(screen, card_fill, card_rect, border_radius=12)
+                pygame.draw.rect(screen, variant["color"], card_rect, 3, border_radius=12)
+
+                swatch_center = (card_rect.centerx, card_rect.y + 34)
+                pygame.draw.circle(screen, variant["color"], swatch_center, 20)
+                pygame.draw.circle(screen, variant["light_color"], swatch_center, 20, 2)
+
+                base_label = small_font.render(f"{ELEMENTS[element]['name']} VARIANT", True, (200, 200, 210))
+                screen.blit(base_label, base_label.get_rect(center=(card_rect.centerx, card_rect.y + 62)))
+
+                name_label = font.render(variant["name"], True, "white")
+                screen.blit(name_label, name_label.get_rect(center=(card_rect.centerx, card_rect.y + 84)))
+
+                if is_owned:
+                    button_color = (70, 130, 80)
+                    button_label = "OWNED"
+                elif can_afford:
+                    button_color = (210, 150, 40) if button_rect.collidepoint(mouse) else (170, 120, 30)
+                    button_label = f"BUY - {variant['cost']} COINS"
+                else:
+                    button_color = (90, 60, 60)
+                    button_label = f"NEED {variant['cost']} COINS"
+
+                pygame.draw.rect(screen, button_color, button_rect, border_radius=8)
+                button_text = small_font.render(button_label, True, "white")
+                screen.blit(button_text, button_text.get_rect(center=button_rect.center))
+
+    if shop_error:
+        draw_text(shop_error, WIDTH // 2 - 200, HEIGHT - 46, (255, 130, 120))
 
     pygame.draw.rect(screen, (75, 75, 90), back_button, border_radius=8)
     draw_text("BACK", 63, 36)
 
 
 def draw_settings():
-    title = big_font.render("SETTINGS", True, "white")
-    screen.blit(title, title.get_rect(center=(WIDTH // 2, 120)))
+    draw_title_banner("SETTINGS", y=120, color="white")
 
     mouse = pygame.mouse.get_pos()
     label_max_width = SETTINGS_BUTTON_WIDTH - 24
@@ -4462,8 +4694,7 @@ ACCOUNT_DELETE_CANCEL_BUTTON = pygame.Rect(555, 380, 195, 50)
 
 
 def draw_account_hub():
-    title = big_font.render("ACCOUNT", True, "white")
-    screen.blit(title, title.get_rect(center=(WIDTH // 2, 120)))
+    draw_title_banner("ACCOUNT", y=120, color="white")
 
     mouse = pygame.mouse.get_pos()
 
@@ -4472,17 +4703,19 @@ def draw_account_hub():
             (ACCOUNT_LOGIN_BUTTON, "LOG IN"),
             (ACCOUNT_REGISTER_BUTTON, "CREATE ACCOUNT"),
         ]:
-            color = (220, 110, 45) if button.collidepoint(mouse) else (90, 80, 85)
-            pygame.draw.rect(screen, color, button, border_radius=12)
-            text = font.render(label, True, "white")
-            screen.blit(text, text.get_rect(center=button.center))
+            draw_nice_button(button, label, mouse)
 
         draw_text(
             "Not logged in. Your stats sync across any device once you log in.",
             WIDTH // 2 - 260, 230, (190, 190, 200),
         )
     else:
-        draw_text(f"Logged in as: {account_username}", WIDTH // 2 - 130, 190, (255, 210, 120), big_font)
+        panel = pygame.Rect(0, 0, 480, 300)
+        panel.center = (WIDTH // 2, 340)
+        draw_panel(panel, accent_color=(255, 190, 60))
+
+        name_label = big_font.render(account_username, True, (255, 210, 120))
+        screen.blit(name_label, name_label.get_rect(center=(panel.centerx, panel.y + 34)))
 
         stats = account_stats or {}
         level = stats.get("level", 1)
@@ -4497,39 +4730,30 @@ def draw_account_hub():
             ("Losses", str(stats.get("losses", 0))),
         ]
 
-        row_y = 250
+        row_y = panel.y + 76
 
         for label, value in rows:
-            draw_text(f"{label}:", WIDTH // 2 - 150, row_y, (170, 175, 190))
-            draw_text(value, WIDTH // 2 + 30, row_y, "white")
-            row_y += 32
+            draw_text(f"{label}:", panel.x + 30, row_y, (170, 175, 190))
+            draw_text(value, panel.x + 220, row_y, "white")
+            row_y += 30
 
         if level < len(LEVEL_THRESHOLDS):
             next_threshold = LEVEL_THRESHOLDS[level]
             draw_text(
                 f"XP: {xp} / {next_threshold} to level {level + 1}",
-                WIDTH // 2 - 150, row_y, (150, 190, 255),
+                panel.x + 30, row_y, (150, 190, 255),
             )
         else:
-            draw_text(f"XP: {xp} - MAX LEVEL", WIDTH // 2 - 150, row_y, (150, 190, 255))
+            draw_text(f"XP: {xp} - MAX LEVEL", panel.x + 30, row_y, (150, 190, 255))
 
-        row_y += 40
-
-        color = (170, 90, 90) if ACCOUNT_LOGOUT_BUTTON.collidepoint(mouse) else (110, 70, 70)
-        pygame.draw.rect(screen, color, ACCOUNT_LOGOUT_BUTTON, border_radius=12)
-        text = font.render("LOG OUT", True, "white")
-        screen.blit(text, text.get_rect(center=ACCOUNT_LOGOUT_BUTTON.center))
-
-        delete_color = (190, 60, 55) if ACCOUNT_DELETE_BUTTON.collidepoint(mouse) else (95, 45, 45)
-        pygame.draw.rect(screen, delete_color, ACCOUNT_DELETE_BUTTON, border_radius=12)
-        delete_text = font.render("DELETE ACCOUNT", True, "white")
-        screen.blit(delete_text, delete_text.get_rect(center=ACCOUNT_DELETE_BUTTON.center))
+        draw_nice_button(ACCOUNT_LOGOUT_BUTTON, "LOG OUT", mouse, accent=(170, 90, 90), idle=(110, 70, 70))
+        draw_nice_button(ACCOUNT_DELETE_BUTTON, "DELETE ACCOUNT", mouse, accent=(190, 60, 55), idle=(95, 45, 45))
 
         if stats.get("is_admin"):
-            admin_color = (150, 90, 220) if ACCOUNT_ADMIN_PANEL_BUTTON.collidepoint(mouse) else (85, 60, 120)
-            pygame.draw.rect(screen, admin_color, ACCOUNT_ADMIN_PANEL_BUTTON, border_radius=12)
-            admin_text = font.render("ADMIN PANEL", True, "white")
-            screen.blit(admin_text, admin_text.get_rect(center=ACCOUNT_ADMIN_PANEL_BUTTON.center))
+            draw_nice_button(
+                ACCOUNT_ADMIN_PANEL_BUTTON, "ADMIN PANEL", mouse,
+                accent=(150, 90, 220), idle=(85, 60, 120),
+            )
 
     if account_error:
         draw_text(account_error, WIDTH // 2 - 260, 630, (255, 130, 120))
@@ -4690,8 +4914,7 @@ def admin_panel_row_rects(index):
 
 
 def draw_admin_panel():
-    title = big_font.render("ADMIN PANEL", True, (200, 150, 255))
-    screen.blit(title, title.get_rect(center=(WIDTH // 2, 90)))
+    draw_title_banner("ADMIN PANEL", y=90, color=(200, 150, 255))
 
     draw_text(f"{len(admin_accounts)} account(s)", 70, 130, (170, 175, 190))
 
@@ -4956,8 +5179,21 @@ def draw_character_select():
         screen.blit(name_label, name_label.get_rect(center=(button.centerx, button.y + 68)))
 
         if unlocked:
-            draw_text(data["short_name"], button.x + 20, button.y + 96)
-            draw_text(data["long_name"], button.x + 20, button.y + 118)
+            owned = owned_variants_for(element)
+
+            if owned:
+                current_variant = get_equipped_variant(element)
+                skin_label = current_variant["name"] if current_variant else "Default"
+                draw_text(data["short_name"], button.x + 20, button.y + 96)
+
+                skin_button = pygame.Rect(button.x + 20, button.y + 118, button.width - 40, 22)
+                skin_color = (90, 85, 60) if skin_button.collidepoint(mouse) else (65, 62, 48)
+                pygame.draw.rect(screen, skin_color, skin_button, border_radius=6)
+                skin_text = small_font.render(f"SKIN: {skin_label}  (click to choose)", True, (230, 220, 180))
+                screen.blit(skin_text, skin_text.get_rect(center=skin_button.center))
+            else:
+                draw_text(data["short_name"], button.x + 20, button.y + 96)
+                draw_text(data["long_name"], button.x + 20, button.y + 118)
         else:
             required_level = CHARACTER_UNLOCK_LEVEL.get(element, 1)
             draw_text(f"LOCKED - reach level {required_level}", button.x + 20, button.y + 96, (170, 170, 178))
@@ -4988,6 +5224,84 @@ def draw_character_select():
     pygame.draw.rect(screen, (75, 75, 90), back_button, border_radius=8)
     draw_text("BACK", 63, 36)
 
+
+def variant_picker_options():
+    """Returns [(variant_id_or_None, name, color, light_color, rect), ...]
+    for the element currently being customized - None represents the
+    default kit, laid out side by side with each owned variant."""
+    element = variant_picker_element
+
+    if element is None:
+        return []
+
+    base_data = ELEMENTS[element]
+    owned = owned_variants_for(element)
+
+    entries = [(None, "Default", base_data["color"], base_data["light_color"])]
+    entries += [(v["id"], v["name"], v["color"], v["light_color"]) for v in owned]
+
+    card_width = 200
+    card_height = 220
+    gap = 24
+    row_width = len(entries) * card_width + (len(entries) - 1) * gap
+    start_x = WIDTH // 2 - row_width // 2
+    card_y = HEIGHT // 2 - card_height // 2
+
+    options = []
+
+    for index, (variant_id, name, color, light_color) in enumerate(entries):
+        rect = pygame.Rect(start_x + index * (card_width + gap), card_y, card_width, card_height)
+        options.append((variant_id, name, color, light_color, rect))
+
+    return options
+
+
+def draw_variant_picker():
+    # The character select screen stays visible underneath, dimmed.
+    draw_character_select()
+
+    dim = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    dim.fill((5, 5, 10, 190))
+    screen.blit(dim, (0, 0))
+
+    options = variant_picker_options()
+
+    bar_padding = 40
+    bar = pygame.Rect(0, 0, WIDTH - 160, 300)
+    bar.center = (WIDTH // 2, HEIGHT // 2)
+    pygame.draw.rect(screen, (24, 25, 32), bar, border_radius=16)
+    pygame.draw.rect(screen, (90, 90, 105), bar, 2, border_radius=16)
+
+    element_name = ELEMENTS[variant_picker_element]["name"] if variant_picker_element else ""
+    title = big_font.render(f"CHOOSE A SKIN - {element_name}", True, "white")
+    screen.blit(title, title.get_rect(center=(WIDTH // 2, bar.top + 32)))
+
+    mouse = pygame.mouse.get_pos()
+    equipped = get_equipped_variant(variant_picker_element) if variant_picker_element else None
+    equipped_id = equipped["id"] if equipped else None
+
+    for variant_id, name, color, light_color, rect in options:
+        is_equipped = variant_id == equipped_id
+        hovered = rect.collidepoint(mouse)
+
+        card_color = tuple(min(255, channel + 30) for channel in color) if hovered else color
+        pygame.draw.rect(screen, tuple(channel // 3 for channel in card_color), rect, border_radius=12)
+        border_color = (255, 255, 255) if is_equipped else light_color
+        pygame.draw.rect(screen, border_color, rect, 3, border_radius=12)
+
+        swatch_center = (rect.centerx, rect.y + 60)
+        pygame.draw.circle(screen, color, swatch_center, 34)
+        pygame.draw.circle(screen, light_color, swatch_center, 34, 3)
+
+        name_label = font.render(name, True, "white")
+        screen.blit(name_label, name_label.get_rect(center=(rect.centerx, rect.y + 130)))
+
+        if is_equipped:
+            equipped_label = small_font.render("EQUIPPED", True, (140, 230, 150))
+            screen.blit(equipped_label, equipped_label.get_rect(center=(rect.centerx, rect.y + 160)))
+
+    hint = small_font.render("Click a skin to equip it, or click outside to cancel.", True, (190, 190, 200))
+    screen.blit(hint, hint.get_rect(center=(WIDTH // 2, bar.bottom - 24)))
 
 map_select_buttons = {}
 
@@ -5453,6 +5767,31 @@ def draw_projectile_shape(surface, screen_pos, velocity, element, color, radius)
         pygame.draw.circle(surface, color, screen_pos, radius)
 
 
+def draw_fire_ring(ring_state):
+    origin = world_to_screen(ring_state["owner"].pos)
+    radius = ring_state["radius"]
+    fade = max(0.0, ring_state["life"] / ring_state["max_life"])
+    t = pygame.time.get_ticks() / 1000
+
+    ring_surface = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
+    center = (radius, radius)
+    pygame.draw.circle(ring_surface, (80, 150, 255, int(40 * fade)), center, radius)
+    screen.blit(ring_surface, (origin.x - radius, origin.y - radius))
+
+    flame_count = 18
+
+    for index in range(flame_count):
+        angle = (index / flame_count) * 2 * math.pi
+        flicker = (math.sin(t * 10 + index * 2) + 1) / 2
+        flame_height = 10 + flicker * 14
+        base = origin + Vector2(math.cos(angle), math.sin(angle)) * radius
+        tip = base + Vector2(math.cos(angle), math.sin(angle)) * flame_height * 0.3 - Vector2(0, flame_height)
+        color = (120, 190, 255) if flicker > 0.5 else (60, 130, 255)
+        pygame.draw.line(screen, color, (base.x, base.y), (tip.x, tip.y), 3)
+
+    pygame.draw.circle(screen, (160, 210, 255), origin, radius, 2)
+
+
 def draw_symphony_cone(symphony_state):
     owner = symphony_state["owner"]
     origin = world_to_screen(owner.pos)
@@ -5506,6 +5845,27 @@ def draw_symphony_cone(symphony_state):
     pygame.draw.line(screen, (255, 180, 240), (origin.x, origin.y), right_edge, 2)
 
 
+def draw_variant_flame_aura(screen_pos, variant_data):
+    """A ring of small flickering flame licks around the body - used for
+    Blue Inferno, and any future variant that wants a similar "actual
+    flame effects" skin treatment."""
+    t = pygame.time.get_ticks() / 1000
+    flame_count = 10
+
+    for index in range(flame_count):
+        angle = (index / flame_count) * 2 * math.pi + t * 0.6
+        flicker = (math.sin(t * 9 + index * 3) + 1) / 2
+        base_radius = 17
+        flame_height = 5 + flicker * 8
+
+        direction = Vector2(math.cos(angle), math.sin(angle))
+        base = screen_pos + direction * base_radius
+        tip = base + direction * flame_height * 0.4 - Vector2(0, flame_height)
+
+        color = variant_data["light_color"] if flicker > 0.5 else variant_data["color"]
+        pygame.draw.line(screen, color, (base.x, base.y), (tip.x, tip.y), 2)
+
+
 def draw_fighter_weapon(screen_pos, fighter):
     """Draws each character's signature melee weapon in their hand -
     held at rest normally, and swung through an arc during a short
@@ -5537,7 +5897,8 @@ def draw_fighter_weapon(screen_pos, fighter):
         guard = hand + forward * 6
         pygame.draw.line(screen, (100, 75, 40), guard - perp * 7, guard + perp * 7, 3)
         if swinging:
-            pygame.draw.circle(screen, (255, 150, 60), (int(tip.x), int(tip.y)), 5)
+            glow_color = (140, 190, 255) if fighter.variant == "fire_blueflame" else (255, 150, 60)
+            pygame.draw.circle(screen, glow_color, (int(tip.x), int(tip.y)), 5)
 
     elif element == "ice":
         head = hand + forward * 24
@@ -5849,6 +6210,9 @@ def draw_match():
     if symphony is not None:
         draw_symphony_cone(symphony)
 
+    if fire_ring is not None:
+        draw_fire_ring(fire_ring)
+
     if vine_whip is not None:
         pygame.draw.line(
             screen,
@@ -5936,7 +6300,14 @@ def draw_match():
     for fighter in living_fighters():
         data = ELEMENTS[fighter.element]
         color = data["color"]
+        light_color = data["light_color"]
         screen_pos = world_to_screen(fighter.pos)
+
+        equipped_variant = variants.get_variant(fighter.element, fighter.variant) if fighter.variant else None
+
+        if equipped_variant is not None:
+            color = equipped_variant["color"]
+            light_color = equipped_variant["light_color"]
 
         if fighter is player and burrow is not None:
             color = (95, 70, 45)
@@ -5947,6 +6318,9 @@ def draw_match():
             pygame.draw.circle(faded, (255, 255, 255, 90), (22, 22), 18, 2)
             screen.blit(faded, (screen_pos.x - 22, screen_pos.y - 22))
         else:
+            if equipped_variant is not None:
+                draw_variant_flame_aura(screen_pos, equipped_variant)
+
             pygame.draw.circle(screen, color, screen_pos, 18)
             pygame.draw.circle(screen, "white", screen_pos, 18, 2)
 
@@ -5959,7 +6333,7 @@ def draw_match():
             draw_status_icons(screen_pos, fighter)
 
         label = "YOU" if fighter is player else fighter.name
-        draw_text(label, screen_pos.x - 25, screen_pos.y + 25, data["light_color"])
+        draw_text(label, screen_pos.x - 25, screen_pos.y + 25, light_color)
 
         if fighter is player and in_shadow_pocket(player):
             draw_text(
@@ -6316,11 +6690,33 @@ while running:
 
         if game_state == "shop":
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                if account_username is None and ACCOUNT_LOGIN_BUTTON.collidepoint(event.pos):
-                    account_error = ""
-                    game_state = "account_hub"
-                elif back_button.collidepoint(event.pos):
+                if back_button.collidepoint(event.pos):
                     game_state = "menu"
+                elif account_username is None:
+                    if ACCOUNT_LOGIN_BUTTON.collidepoint(event.pos):
+                        account_error = ""
+                        game_state = "account_hub"
+                else:
+                    owned = (account_stats or {}).get("owned_variants", [])
+                    currency = (account_stats or {}).get("currency", 0)
+
+                    for element, variant, card_rect, button_rect in shop_variant_cards():
+                        if not button_rect.collidepoint(event.pos) or variant["id"] in owned:
+                            continue
+
+                        if currency < variant["cost"]:
+                            shop_error = "Not enough coins for that yet."
+                        else:
+                            shop_error = "Working..."
+                            success, result = account.purchase_variant(account_username, element, variant["id"])
+
+                            if success:
+                                account_stats = result
+                                shop_error = ""
+                            else:
+                                shop_error = result
+
+                        break
             continue
 
         if game_state == "settings":
@@ -6661,12 +7057,25 @@ while running:
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 for element, base_button in element_buttons.items():
                     button = character_select_screen_rect(base_button)
+                    owned = owned_variants_for(element)
+                    skin_button = None
 
-                    if (
-                        button.collidepoint(event.pos)
-                        and char_viewport.collidepoint(event.pos)
-                        and is_character_unlocked(element)
-                    ):
+                    if owned:
+                        skin_button = pygame.Rect(button.x + 20, button.y + 118, button.width - 40, 22)
+
+                    if not (button.collidepoint(event.pos) and char_viewport.collidepoint(event.pos)):
+                        continue
+
+                    if not is_character_unlocked(element):
+                        continue
+
+                    if skin_button is not None and skin_button.collidepoint(event.pos):
+                        variant_picker_element = element
+                        game_state = "variant_picker"
+                    else:
+                        if selected_element != element:
+                            selected_variant_id = None
+
                         selected_element = element
 
                         if practice_mode:
@@ -6702,6 +7111,30 @@ while running:
                 character_select_scroll = max(
                     0, min(character_select_max_scroll(), character_select_scroll)
                 )
+            continue
+
+        if game_state == "variant_picker":
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                bar = pygame.Rect(0, 0, WIDTH - 160, 300)
+                bar.center = (WIDTH // 2, HEIGHT // 2)
+                clicked_option = False
+
+                for variant_id, name, color, light_color, rect in variant_picker_options():
+                    if rect.collidepoint(event.pos):
+                        selected_element = variant_picker_element
+                        selected_variant_id = variant_id
+                        variant_picker_element = None
+                        game_state = "character_select"
+                        clicked_option = True
+                        break
+
+                if not clicked_option and not bar.collidepoint(event.pos):
+                    # Clicked outside the bar entirely - cancel, no change.
+                    variant_picker_element = None
+                    game_state = "character_select"
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                variant_picker_element = None
+                game_state = "character_select"
             continue
 
         if game_state == "map_select":
@@ -7108,7 +7541,9 @@ while running:
             else:
                 shoot_projectile(player, aim)
 
-            player.cooldowns["long"] = 0.34
+            player.cooldowns["long"] = 1.4 if (
+                player.element == "fire" and player.variant == "fire_blueflame"
+            ) else 0.34
 
             if tutorial_active:
                 tutorial_long_used = True
@@ -7193,7 +7628,7 @@ while running:
                 tutorial_step += 1
                 tutorial_advance_pressed = False
 
-    screen.fill((20, 24, 35))
+    draw_menu_background()
 
     if game_state == "menu":
         draw_menu()
@@ -7229,6 +7664,8 @@ while running:
         draw_how_to_play()
     elif game_state == "character_select":
         draw_character_select()
+    elif game_state == "variant_picker":
+        draw_variant_picker()
     elif game_state == "map_select":
         draw_map_select()
     elif game_state == "opponent_select":
